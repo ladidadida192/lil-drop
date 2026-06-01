@@ -7,9 +7,15 @@ import { z } from "zod";
 import cron from "node-cron";
 import { analyzeTradingSystem } from "./aiAnalyst";
 import { reviewStrategyWithAi } from "./aiStrategyReviewer.js";
+import { runAutomatedDriftSystem } from "./driftMonitor";
 
 
-const envpath = "C:/Users/janba/OneDrive/Desktop/Schule/ATS/mt4-trade-api/.env";
+const strategyVersion = "v1.0";
+const testType = "FORWARD";
+
+
+
+const envpath = "/root/lil-drop/big-drop-main/.env";
 
 console.log("CURRENT WORKING DIR:", process.cwd());
 console.log("SERVER FILE:", import.meta.url);
@@ -20,7 +26,7 @@ console.log(fs.readFileSync(envpath, "utf8"));
 console.log("SERVER API KEY:", process.env.API_KEY);
 
 dotenv.config({
-  path: envpath,
+path: envpath,
   override: true
 });
 
@@ -42,6 +48,32 @@ app.use((req, res, next) => {
   console.log("REQUEST HIT:", req.method, req.url);
   next();
 });
+
+
+app.get("/ping", (req, res) => {
+  console.log("PING HIT");
+  res.json({ ok: true });
+});
+
+
+
+app.use((err: any, req: any, res: any, next: any) => {
+  console.error("JSON_PARSE_ERROR", {
+    method: req.method,
+    url: req.url,
+    message: err.message,
+  });
+
+  res.status(400).json({
+    ok: false,
+    reason: "JSON_PARSE_ERROR",
+    url: req.url,
+    message: err.message,
+  });
+});
+
+
+
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -67,6 +99,10 @@ function checkApiKey(req: express.Request, res: express.Response, next: express.
   console.log("✅ AUTHORIZED");
   next();
 }
+
+app.listen(3000, "0.0.0.0", () => {
+  console.log("Server running on port 3000");
+});
 
 const tradeEventSchema = z.object({
   ticket: z.number().int().positive(),
@@ -118,7 +154,7 @@ app.post("/trade-event", checkApiKey, async (req, res) => {
 
   await pool.query(
     `INSERT INTO trade_events (ticket, event_type, symbol, order_type, lots, entry_price, exit_price, stop_loss, take_profit, profit, reason, event_time, test_type, strategy_version)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
     [data.ticket, data.eventType, data.symbol, data.orderType, data.lots, data.entryPrice, data.exitPrice, data.stopLoss, data.takeProfit, data.profit, data.reason, data.eventTime, data.testType, data.strategyVersion]
   );
 
@@ -174,7 +210,7 @@ app.post("/market-snapshot", checkApiKey, async (req, res) => {
 
   await pool.query(
     `INSERT INTO market_snapshots (ticket, symbol, spread, atr, trend_status, session, candle_range, seconds_since_last_move, snapshot_time, test_type, strategy_version)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
     [data.ticket, data.symbol, data.spread, data.atr, data.trendStatus, data.session, data.candleRange, data.secondsSinceLastMove, data.snapshotTime, data.testType, data.strategyVersion]
   );
 
@@ -334,7 +370,7 @@ app.post("/analyzer-data", checkApiKey, async (req, res) => {
         $20, $21, $22,
         $23, $24, $25,
         $26, $27, $28, $29,
-        $30, $31
+        $30, $31, $32, $33
       )
       ON CONFLICT DO NOTHING
       `,
@@ -462,7 +498,7 @@ app.post("/trade-exit", checkApiKey, async (req, res) => {
         test_type,
         strategy_version
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       ON CONFLICT (ticket) DO NOTHING
       `,
       [
@@ -553,7 +589,7 @@ app.post("/management-event", checkApiKey, async (req, res) => {
         test_type,
         strategy_version
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       `,
       [
         data.ticket,
@@ -683,7 +719,7 @@ app.post("/execution-diagnostics", checkApiKey, async (req, res) => {
         stop_atr_ratio,
 
         session,
-        diagnostic_time
+        diagnostic_time,
 
         test_type,
         strategy_version
@@ -696,7 +732,7 @@ app.post("/execution-diagnostics", checkApiKey, async (req, res) => {
         $15,$16,
         $17,$18,$19,
         $20,$21,
-        $22,$23
+        $22,$23,$24,$25
       )
       `,
       [
@@ -882,7 +918,7 @@ app.post("/market-regime", checkApiKey, async (req, res) => {
         $20,$21,$22,$23,
         $24,$25,
         $26,
-        $27,$28,$29
+        $27,$28,$29,$30,$31
       )
       `,
       [
@@ -1869,9 +1905,7 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
   }
 });
 
-cron.schedule("0 0 * * *", async () => {
-  await pool.query("SELECT generate_daily_report(...)");
-});
+
 
 const marketPhaseProfileSchema = z.object({
   symbol: z.string().min(1),
@@ -2170,49 +2204,108 @@ app.post("/ai/strategy-review", checkApiKey, async (req, res) => {
   }
 });
 
+const symbols = [
+  "EURUSD",
+  "USDJPY",
+  "GBPJPY",
+  "AUDUSD",
+  "GOLD",
+  "SILVER",
+  "BTCUSD",
+  "US500",
+  "US100"
+];
+
+async function getActiveSymbols() {
+  const result = await pool.query(`
+    SELECT DISTINCT symbol
+    FROM trade_exits
+    WHERE strategy_version = $1
+  `, [strategyVersion]);
+
+  return result.rows.map(r => r.symbol);
+}
+
+function todayDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function daysAgoDate(days: number) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
 cron.schedule("0 0 * * *", async () => {
-  const analysis = await analyzeTradingSystem("SILVER");
-  console.log("Daily AI analysis:", analysis);
-});
+  const symbols = await getActiveSymbols();
 
-cron.schedule("5 0 * * *", async () => {
-  try {
-    const symbol = "SILVER";
-    const strategyVersion = "v1.0";
-    const testType = "FORWARD";
-
-    const profileEnd = new Date();
-    const profileStart = new Date();
-
-    profileStart.setDate(profileEnd.getDate() - 30);
-
-    const formatDate = (d: Date) => d.toISOString().slice(0, 10);
-
-    const body = {
-      symbol,
-      profileStart: formatDate(profileStart),
-      profileEnd: formatDate(profileEnd),
-      testType,
-      strategyVersion,
-    };
-
-    const response = await fetch("http://127.0.0.1:3000/market-phase-profile", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.API_KEY!,
-      },
-      body: JSON.stringify(body),
-    });
-
-    const result = await response.json();
-
-    console.log("Forward market phase profile generated:", result);
-  } catch (err) {
-    console.error("Forward market phase profile cron failed:", err);
+  for (const symbol of symbols) {
+    try {
+      const analysis = await analyzeTradingSystem(symbol);
+      console.log("Daily AI analysis:", symbol, analysis);
+    } catch (err) {
+      console.error("Daily AI analysis failed:", symbol, err);
+    }
   }
 });
 
+cron.schedule("10 0 * * *", async () => {
+  const symbols = await getActiveSymbols();
+  const reportDate = todayDate();
+
+  for (const symbol of symbols) {
+    try {
+      await fetch("http://127.0.0.1:3000/daily-report", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.API_KEY!,
+        },
+        body: JSON.stringify({ symbol, reportDate }),
+      });
+
+      await fetch("http://127.0.0.1:3000/weekly-winner", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.API_KEY!,
+        },
+        body: JSON.stringify({ symbol, reportDate }),
+      });
+
+      await fetch("http://127.0.0.1:3000/market-phase-profile", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.API_KEY!,
+        },
+        body: JSON.stringify({
+          symbol,
+          profileStart: daysAgoDate(30),
+          profileEnd: reportDate,
+          testType,
+          strategyVersion,
+        }),
+      });
+
+      await runAutomatedDriftSystem(symbol, strategyVersion);
+
+      await reviewStrategyWithAi(symbol, strategyVersion);
+
+      console.log("Automated analyzer completed:", symbol);
+    } catch (err) {
+      console.error("Automated analyzer failed:", symbol, err);
+    }
+  }
+});
+
+
+
+
 app.listen(process.env.PORT, () => {
   console.log(`API läuft auf Port ${process.env.PORT}`);
+});
+
+app.listen(3000, "0.0.0.0", () => {
+  console.log("Server running on port 3000");
 });

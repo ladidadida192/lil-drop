@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 
 dotenv.config({
-  path: "C:/Users/janba/OneDrive/Desktop/Schule/ATS/mt4-trade-api/.env",
+  path: "/root/lil-drop/big-drop-main/.env",
   override: true
 });
 
