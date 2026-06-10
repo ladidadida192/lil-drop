@@ -20,10 +20,6 @@ const envpath = "/root/lil-drop/big-drop-main/.env";
 console.log("CURRENT WORKING DIR:", process.cwd());
 console.log("SERVER FILE:", import.meta.url);
 console.log("ENV PATH EXISTS:", fs.existsSync(envpath));
-console.log("ENV FILE CONTENT:");
-console.log(fs.readFileSync(envpath, "utf8"));
-
-console.log("SERVER API KEY:", process.env.API_KEY);
 
 dotenv.config({
 path: envpath,
@@ -100,9 +96,7 @@ function checkApiKey(req: express.Request, res: express.Response, next: express.
   next();
 }
 
-app.listen(3000, "0.0.0.0", () => {
-  console.log("Server running on port 3000");
-});
+
 
 const tradeEventSchema = z.object({
   ticket: z.number().int().positive(),
@@ -219,27 +213,25 @@ app.post("/market-snapshot", checkApiKey, async (req, res) => {
   return res.json({ ok: true });
 });
 
-app.get("/debug/api-key", (req, res) => {
+app.get("/debug/api-key", checkApiKey, (req, res) => {
   res.json({
-    apiKey: process.env.API_KEY,
+    apiKeyLoaded: !!process.env.API_KEY,
     apiKeyLength: process.env.API_KEY?.length
   });
 });
 
-app.get("/debug/identity", (req, res) => {
+app.get("/debug/identity", checkApiKey, (req, res) => {
   res.json({
     runningFile: import.meta.url,
     currentFolder: process.cwd(),
-    envPath: envpath,
     envExists: fs.existsSync(envpath),
     port: process.env.PORT,
-    apiKey: process.env.API_KEY,
-    databaseUrl: process.env.DATABASE_URL
+    databaseUrlLoaded: !!process.env.DATABASE_URL
   });
 });
 
-app.get("/routes", (req, res) => {
-  res.send("Server is THIS file");
+app.get("/routes", checkApiKey, (req, res) => {
+  res.send("Server is running");
 });
 
 const analyzerDataSchema = z.object({
@@ -499,7 +491,18 @@ app.post("/trade-exit", checkApiKey, async (req, res) => {
         strategy_version
       )
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      ON CONFLICT (ticket) DO NOTHING
+      ON CONFLICT (ticket, symbol, test_type, strategy_version)
+DO UPDATE SET
+  direction = EXCLUDED.direction,
+  exit_time = EXCLUDED.exit_time,
+  exit_price = EXCLUDED.exit_price,
+  profit = EXCLUDED.profit,
+  profit_r = EXCLUDED.profit_r,
+  exit_reason = EXCLUDED.exit_reason,
+  hit_tp = EXCLUDED.hit_tp,
+  hit_sl = EXCLUDED.hit_sl,
+  closed_by_exit_logic = EXCLUDED.closed_by_exit_logic,
+  closed_by_opposite_bos = EXCLUDED.closed_by_opposite_bos;
       `,
       [
         data.ticket,
@@ -1085,7 +1088,10 @@ app.post("/daily-report", checkApiKey, async (req, res) => {
           COUNT(*) FILTER (WHERE event_type = 'MOVE_TO_BREAKEVEN')::int AS breakeven_moves,
           COUNT(*) FILTER (WHERE event_type = 'STRUCTURE_TRAILING')::int AS structure_trailing_moves
         FROM trade_management_events m
-        JOIN closed_trades c ON c.ticket = m.ticket
+        JOIN closed_trades c
+          ON c.ticket = m.ticket
+         AND c.test_type = m.test_type
+         AND c.strategy_version = m.strategy_version
       ),
 
       regime_stats AS (
@@ -1095,7 +1101,11 @@ app.post("/daily-report", checkApiKey, async (req, res) => {
           COUNT(*) FILTER (WHERE r.is_high_vol = true)::int AS high_vol_trades,
           COUNT(*) FILTER (WHERE r.is_low_vol = true)::int AS low_vol_trades
         FROM market_regime_snapshots r
-        JOIN closed_trades c ON c.ticket = r.ticket
+        JOIN closed_trades c
+          ON c.ticket = r.ticket
+         AND c.symbol = r.symbol
+         AND c.test_type = r.test_type
+         AND c.strategy_version = r.strategy_version
       ),
 
       session_profit AS (
@@ -1103,7 +1113,11 @@ app.post("/daily-report", checkApiKey, async (req, res) => {
           s.session,
           SUM(c.profit) AS session_profit
         FROM trade_analyzer_setups s
-        JOIN closed_trades c ON c.ticket = s.ticket
+        JOIN closed_trades c
+          ON c.ticket = s.ticket
+         AND c.symbol = s.symbol
+         AND c.test_type = s.test_type
+         AND c.strategy_version = s.strategy_version
         GROUP BY s.session
       ),
 
@@ -1124,28 +1138,44 @@ app.post("/daily-report", checkApiKey, async (req, res) => {
       regime_profit AS (
         SELECT 'TREND' AS regime, SUM(c.profit) AS profit
         FROM market_regime_snapshots r
-        JOIN closed_trades c ON c.ticket = r.ticket
+        JOIN closed_trades c
+          ON c.ticket = r.ticket
+         AND c.symbol = r.symbol
+         AND c.test_type = r.test_type
+         AND c.strategy_version = r.strategy_version
         WHERE r.is_trend = true
 
         UNION ALL
 
         SELECT 'RANGE' AS regime, SUM(c.profit) AS profit
         FROM market_regime_snapshots r
-        JOIN closed_trades c ON c.ticket = r.ticket
+        JOIN closed_trades c
+          ON c.ticket = r.ticket
+         AND c.symbol = r.symbol
+         AND c.test_type = r.test_type
+         AND c.strategy_version = r.strategy_version
         WHERE r.is_range = true
 
         UNION ALL
 
         SELECT 'HIGH_VOL' AS regime, SUM(c.profit) AS profit
         FROM market_regime_snapshots r
-        JOIN closed_trades c ON c.ticket = r.ticket
+        JOIN closed_trades c
+          ON c.ticket = r.ticket
+         AND c.symbol = r.symbol
+         AND c.test_type = r.test_type
+         AND c.strategy_version = r.strategy_version
         WHERE r.is_high_vol = true
 
         UNION ALL
 
         SELECT 'LOW_VOL' AS regime, SUM(c.profit) AS profit
         FROM market_regime_snapshots r
-        JOIN closed_trades c ON c.ticket = r.ticket
+        JOIN closed_trades c
+          ON c.ticket = r.ticket
+         AND c.symbol = r.symbol
+         AND c.test_type = r.test_type
+         AND c.strategy_version = r.strategy_version
         WHERE r.is_low_vol = true
       ),
 
@@ -1271,6 +1301,7 @@ app.post("/daily-report", checkApiKey, async (req, res) => {
       CROSS JOIN execution_stats x
       CROSS JOIN management_stats m
       CROSS JOIN regime_stats r
+	WHERE p.total_trades > 1
 
       ON CONFLICT (report_date, symbol)
       DO UPDATE SET
@@ -1347,7 +1378,11 @@ app.post("/daily-report", checkApiKey, async (req, res) => {
           c.ticket,
           c.profit
         FROM closed_trades c
-        JOIN execution_diagnostics x ON x.ticket = c.ticket
+        JOIN execution_diagnostics x
+          ON x.ticket = c.ticket
+         AND x.symbol = c.symbol
+         AND x.test_type = c.test_type
+         AND x.strategy_version = c.strategy_version
       ),
 
       grouped AS (
@@ -1377,23 +1412,25 @@ app.post("/daily-report", checkApiKey, async (req, res) => {
       ),
 
       scored AS (
-        SELECT
-          *,
-          (
-            COALESCE(avg_profit, 0)
-            * COALESCE(profit_factor, 0)
-            * (COALESCE(winrate, 0) / 100.0)
-            * LN(trades + 1)
-          ) AS effectiveness_score
-        FROM grouped
-      ),
+  SELECT
+    *,
+    (
+      ABS(LEAST(COALESCE(avg_profit, 0), 0))
+      * LN(trades + 1)
+      * CASE
+          WHEN execution_reason = 'NORMAL_EXECUTION' THEN 0.5
+          ELSE 1.0
+        END
+    ) AS effectiveness_score
+  FROM grouped
+),
 
-      ranked AS (
-        SELECT
-          *,
-          RANK() OVER (ORDER BY effectiveness_score DESC) AS rank
-        FROM scored
-      )
+ranked AS (
+  SELECT
+    *,
+    RANK() OVER (ORDER BY effectiveness_score DESC) AS rank
+  FROM scored
+)
 
       INSERT INTO daily_execution_reason_rankings (
         report_date,
@@ -1465,17 +1502,22 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
     await pool.query("BEGIN");
 
     await pool.query(
-      `
-      DELETE FROM weekly_pattern_rankings
-      WHERE symbol = $1
-        AND report_date = $2::date;
+  `
+  DELETE FROM weekly_pattern_rankings
+  WHERE symbol = $1
+    AND report_date = $2::date
+  `,
+  [symbol, reportDate]
+);
 
-      DELETE FROM weekly_trade_examples
-      WHERE symbol = $1
-        AND report_date = $2::date;
-      `,
-      [symbol, reportDate]
-    );
+await pool.query(
+  `
+  DELETE FROM weekly_trade_examples
+  WHERE symbol = $1
+    AND report_date = $2::date
+  `,
+  [symbol, reportDate]
+);
 
     await pool.query(
       `
@@ -1516,7 +1558,11 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
             )
           END AS winrate
         FROM closed_trades e
-        JOIN trade_analyzer_setups s ON s.ticket = e.ticket
+        JOIN trade_analyzer_setups s
+          ON s.ticket = e.ticket
+         AND s.symbol = e.symbol
+         AND s.test_type = e.test_type
+         AND s.strategy_version = e.strategy_version
         GROUP BY
           s.volume_pass,
           s.htf_aligned,
@@ -1549,7 +1595,11 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
             )
           END AS winrate
         FROM closed_trades e
-        JOIN trade_analyzer_setups s ON s.ticket = e.ticket
+        JOIN trade_analyzer_setups s
+          ON s.ticket = e.ticket
+         AND s.symbol = e.symbol
+         AND s.test_type = e.test_type
+         AND s.strategy_version = e.strategy_version
         GROUP BY s.session
       ),
 
@@ -1575,7 +1625,11 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
             )
           END AS winrate
         FROM closed_trades e
-        JOIN trade_analyzer_setups s ON s.ticket = e.ticket
+        JOIN trade_analyzer_setups s
+          ON s.ticket = e.ticket
+         AND s.symbol = e.symbol
+         AND s.test_type = e.test_type
+         AND s.strategy_version = e.strategy_version
         GROUP BY s.hour
       ),
 
@@ -1608,7 +1662,11 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
             )
           END AS winrate
         FROM closed_trades e
-        JOIN market_regime_snapshots r ON r.ticket = e.ticket
+        JOIN market_regime_snapshots r
+          ON r.ticket = e.ticket
+         AND r.symbol = e.symbol
+         AND r.test_type = e.test_type
+         AND r.strategy_version = e.strategy_version
         GROUP BY
           r.is_trend,
           r.is_range,
@@ -1647,7 +1705,11 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
             )
           END AS winrate
         FROM closed_trades e
-        JOIN execution_diagnostics x ON x.ticket = e.ticket
+        JOIN execution_diagnostics x
+          ON x.ticket = e.ticket
+         AND x.symbol = e.symbol
+         AND x.test_type = e.test_type
+         AND x.strategy_version = e.strategy_version
         GROUP BY pattern_name
       ),
 
@@ -1758,9 +1820,21 @@ app.post("/weekly-winner", checkApiKey, async (req, res) => {
           x.execution_problem,
           x.execution_error_message
         FROM closed_trades e
-        LEFT JOIN trade_analyzer_setups s ON s.ticket = e.ticket
-        LEFT JOIN market_regime_snapshots r ON r.ticket = e.ticket
-        LEFT JOIN execution_diagnostics x ON x.ticket = e.ticket
+        LEFT JOIN trade_analyzer_setups s
+          ON s.ticket = e.ticket
+         AND s.symbol = e.symbol
+         AND s.test_type = e.test_type
+         AND s.strategy_version = e.strategy_version
+        LEFT JOIN market_regime_snapshots r
+          ON r.ticket = e.ticket
+         AND r.symbol = e.symbol
+         AND r.test_type = e.test_type
+         AND r.strategy_version = e.strategy_version
+        LEFT JOIN execution_diagnostics x
+          ON x.ticket = e.ticket
+         AND x.symbol = e.symbol
+         AND x.test_type = e.test_type
+         AND x.strategy_version = e.strategy_version
       ),
 
       winners AS (
@@ -1968,9 +2042,21 @@ app.post("/market-phase-profile", checkApiKey, async (req, res) => {
           x.slippage_pips
 
         FROM closed_trades e
-        LEFT JOIN market_regime_snapshots r ON r.ticket = e.ticket
-        LEFT JOIN trade_analyzer_setups s ON s.ticket = e.ticket
-        LEFT JOIN execution_diagnostics x ON x.ticket = e.ticket
+        LEFT JOIN market_regime_snapshots r
+          ON r.ticket = e.ticket
+         AND r.symbol = e.symbol
+         AND r.test_type = e.test_type
+         AND r.strategy_version = e.strategy_version
+        LEFT JOIN trade_analyzer_setups s
+          ON s.ticket = e.ticket
+         AND s.symbol = e.symbol
+         AND s.test_type = e.test_type
+         AND s.strategy_version = e.strategy_version
+        LEFT JOIN execution_diagnostics x
+          ON x.ticket = e.ticket
+         AND x.symbol = e.symbol
+         AND x.test_type = e.test_type
+         AND x.strategy_version = e.strategy_version
       ),
 
       stats AS (
@@ -2028,6 +2114,7 @@ app.post("/market-phase-profile", checkApiKey, async (req, res) => {
         FROM stats
       )
 
+	
       INSERT INTO market_phase_profiles (
         profile_start,
         profile_end,
@@ -2088,6 +2175,7 @@ app.post("/market-phase-profile", checkApiKey, async (req, res) => {
 
         phase_label
       FROM labeled
+	WHERE trades >= 15
 
       ON CONFLICT (profile_start, profile_end, symbol, test_type, strategy_version)
       DO UPDATE SET
@@ -2219,11 +2307,21 @@ const symbols = [
 async function getActiveSymbols() {
   const result = await pool.query(`
     SELECT DISTINCT symbol
-    FROM trade_exits
-    WHERE strategy_version = $1
+    FROM (
+      SELECT symbol FROM trade_events WHERE strategy_version = $1
+      UNION
+      SELECT symbol FROM trade_exits WHERE strategy_version = $1
+      UNION
+      SELECT symbol FROM execution_diagnostics WHERE strategy_version = $1
+      UNION
+      SELECT symbol FROM market_regime_snapshots WHERE strategy_version = $1
+	UNION
+      SELECT symbol FROM trade_analyzer_setups WHERE strategy_version = $1
+    ) x
   `, [strategyVersion]);
 
-  return result.rows.map(r => r.symbol);
+  const dbSymbols = result.rows.map(r => r.symbol);
+  return Array.from(new Set([...symbols, ...dbSymbols]));
 }
 
 function todayDate() {
@@ -2302,10 +2400,8 @@ cron.schedule("10 0 * * *", async () => {
 
 
 
-app.listen(process.env.PORT, () => {
-  console.log(`API läuft auf Port ${process.env.PORT}`);
-});
+const port = Number(process.env.PORT ?? 3000);
 
-app.listen(3000, "0.0.0.0", () => {
-  console.log("Server running on port 3000");
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Server running on port ${port}`);
 });
